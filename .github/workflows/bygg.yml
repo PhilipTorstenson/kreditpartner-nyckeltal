@@ -1,0 +1,56 @@
+name: Bygg nyckeltal
+
+# Varje söndag 04:00 (svensk tid ungefär 05–06) och för hand under Actions.
+# Det första bygget läser alla veckofiler sedan 2025 och tar flera timmar. Hinner ett bygge
+# inte klart startar det nästa självt och fortsätter där det slutade.
+on:
+  schedule:
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: bygg
+  cancel-in-progress: false
+
+jobs:
+  bygg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tester
+        run: python3 test_bygg.py
+
+      - name: Hämta förra bygget
+        run: gh release download senaste --dir forra --pattern nyckeltal.zip --pattern behandlade.txt || echo "Inget tidigare bygge, börjar från början"
+
+      - name: Bygg
+        run: python3 bygg.py --forra forra --ut ut --minuter 320
+
+      - name: Publicera
+        run: |
+          gh release view senaste >/dev/null 2>&1 || gh release create senaste --title "Senaste" --notes "Byggs"
+          gh release upload senaste ut/nyckeltal.zip ut/behandlade.txt --clobber
+          gh release edit senaste --notes-file ut/notering.md
+
+      # Ett publikt repo utan commits på 60 dagar får sina schemalagda jobb avstängda,
+      # därför sparas noteringen varje gång.
+      - name: Notera bygget
+        run: |
+          cp ut/notering.md senast.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add senast.md
+          git commit -m "Bygge $(date -u +%Y-%m-%d)" || echo "Ingen ändring"
+          git push
+
+      - name: Fortsätt om bygget inte hann klart
+        run: |
+          if grep -q ofullstandig ut/status.txt; then gh workflow run bygg.yml --ref "${GITHUB_REF_NAME}"; fi
