@@ -126,6 +126,8 @@ def main():
              "arsredovisningar/2026/10_1.zip": open(v1, "rb").read(),
              "arsredovisningar/2026/11_1.zip": open(v2, "rb").read()}
     hamtade = []
+    trasiga = {}  # nyckel -> hur många gånger servern svarar med en felsida i stället för zip-filen
+    lage = {"tom_lista": False}
 
     class Latsas(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -136,6 +138,8 @@ def main():
                 sida2 = "marker=arsredovisningar%2F2026%2F10_1.zip" in self.path
                 nycklar = ["arsredovisningar/2026/11_1.zip"] if sida2 else \
                     ["arsredovisningar/2024/52_1.zip", "arsredovisningar/2026/10_1.zip"]
+                if lage["tom_lista"]:
+                    nycklar = []
                 xml = "<ListBucketResult><IsTruncated>%s</IsTruncated>%s</ListBucketResult>" % (
                     "false" if sida2 else "true",
                     "".join("<Contents><Key>%s</Key><ETag>&#34;e-%s&#34;</ETag><Size>1</Size></Contents>"
@@ -144,7 +148,11 @@ def main():
             else:
                 key = self.path[len("/bulk/"):]
                 hamtade.append(key)
-                data = filer[key]
+                if trasiga.get(key, 0) > 0:
+                    trasiga[key] -= 1
+                    data = b"no available server"  # Bolagsverkets felsida, här med statuskod 200
+                else:
+                    data = filer[key]
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -152,7 +160,8 @@ def main():
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Latsas)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    miljo = dict(os.environ, BOLAGSVERKET_BAS="http://127.0.0.1:%d/bulk" % server.server_port)
+    miljo = dict(os.environ, BOLAGSVERKET_BAS="http://127.0.0.1:%d/bulk" % server.server_port,
+                 BYGG_VANTA="0")  # inga väntetider mellan nya försök i proven
 
     def kor(*args):
         p = subprocess.run([sys.executable, "-I", os.path.join(HAR, "bygg.py")] + list(args),
@@ -178,6 +187,44 @@ def main():
     kor("--ut", ut3, "--minuter", "0")
     assert open(os.path.join(ut3, "status.txt")).read() == "ofullstandig\n"
     ok("när tiden är slut sparas det som hunnits och bygget markeras ofullständigt")
+
+    # Bolagsverkets server svarar ibland med en felsida i stället för zip-filen.
+    def kor_fel(*args):
+        p = subprocess.run([sys.executable, "-I", os.path.join(HAR, "bygg.py")] + list(args),
+                           capture_output=True, text=True, env=miljo, timeout=120)
+        assert p.returncode != 0, "bygget skulle ha misslyckats:\n" + p.stdout
+        return p.stdout + p.stderr
+
+    forsta, andra = "arsredovisningar/2026/10_1.zip", "arsredovisningar/2026/11_1.zip"
+    innan = len(hamtade)
+    trasiga[forsta] = 2
+    ut4 = os.path.join(tmp, "ut4")
+    utskrift = kor("--ut", ut4, "--fran-ar", "2025")
+    assert hamtade[innan:] == [forsta] * 3 + [andra], hamtade[innan:]
+    assert "Klar: 2 bolag" in utskrift
+    ok("en felsida i stället för zip-filen hämtas om, och bygget blir klart")
+
+    trasiga[andra] = 10 ** 9
+    ut5 = os.path.join(tmp, "ut5")
+    utskrift = kor("--ut", ut5, "--fran-ar", "2025")
+    assert "Ofullständig: 2 bolag" in utskrift and open(os.path.join(ut5, "status.txt")).read() == "ofullstandig\n"
+    assert andra not in open(os.path.join(ut5, "behandlade.txt")).read(), "filen ska läsas om nästa gång"
+    ok("en fil som aldrig går att hämta stoppar inte bygget: det sparar det som är läst och tar resten nästa gång")
+    trasiga[andra] = 0
+
+    trasiga[forsta] = 10 ** 9
+    ut6 = os.path.join(tmp, "ut6")
+    assert "ingen zip-fil" in kor_fel("--ut", ut6, "--fran-ar", "2025")
+    assert not os.path.exists(os.path.join(ut6, "nyckeltal.zip")), "inget får publiceras när inget har lästs"
+    trasiga[forsta] = 0
+    ok("går den allra första filen inte att hämta misslyckas bygget tydligt utan att skriva något")
+
+    lage["tom_lista"] = True
+    ut7 = os.path.join(tmp, "ut7")
+    assert "tom" in kor_fel("--ut", ut7, "--fran-ar", "2025")
+    assert not os.path.exists(os.path.join(ut7, "nyckeltal.zip"))
+    lage["tom_lista"] = False
+    ok("en tom fillista ger fel i stället för en tom nyckeltal.zip")
 
     server.shutdown()
     shutil.rmtree(tmp)

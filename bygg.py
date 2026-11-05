@@ -33,6 +33,7 @@ import zipfile
 BAS = os.environ.get("BOLAGSVERKET_BAS",
                      "https://vardefulla-datamangder.bolagsverket.se/arsredovisningar-bulkfiler")
 PREFIX = "arsredovisningar/"
+VANTA = float(os.environ.get("BYGG_VANTA", "30"))  # sekunder mellan försöken (proven sätter 0)
 
 # (kolumn, element i den svenska taxonomin, typ). "period" gäller räkenskapsåret, "balans" dess
 # sista dag och "forra" räkenskapsåret innan.
@@ -268,7 +269,10 @@ def las_veckofil(sokvag, bolag):
     return antal, fel
 
 
-def hamta(url, mal=None, forsok=4):
+def hamta(url, mal=None, forsok=4, ar_zip=False):
+    """Hämtar url (som text/bytes, eller till filen mal). Med ar_zip=True räknas ett svar som inte
+    är en hel zip-fil (till exempel Bolagsverkets felsida "no available server" eller en avbruten
+    nedladdning) som misslyckat, och försöket görs om."""
     for i in range(1, forsok + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "kreditpartner-nyckeltal"})
@@ -281,11 +285,13 @@ def hamta(url, mal=None, forsok=4):
                         if not bit:
                             break
                         f.write(bit)
-                return mal
+            if ar_zip and not zipfile.is_zipfile(mal):
+                raise ValueError("svaret är ingen zip-fil (%d byte)" % os.path.getsize(mal))
+            return mal
         except Exception as e:
             if i >= forsok:
                 raise RuntimeError("%s: %s" % (url, e))
-            time.sleep(30 * i)
+            time.sleep(VANTA * i)
 
 
 def lista_veckofiler():
@@ -373,6 +379,8 @@ def main():
             print("%s: %d årsredovisningar, %d fel" % (fil, antal, fel))
     else:
         alla = lista_veckofiler()
+        if not alla:
+            raise RuntimeError("Bolagsverkets fillista var tom (felsvar?). Inget skrevs, försök igen senare.")
         att_lasa = []
         for key, etag in alla:
             m = re.search(r"/(\d{4})/", key)
@@ -387,14 +395,14 @@ def main():
                     break
                 fil = os.path.join(tmp, "vecka.zip")
                 try:
-                    hamta(BAS + "/" + key, fil)
-                except RuntimeError as e:
-                    print(e)
+                    hamta(BAS + "/" + key, fil, ar_zip=True)
+                    antal, fel = las_veckofil(fil, bolag)
+                except (RuntimeError, zipfile.BadZipFile) as e:
+                    print("%s: %s" % (key, e))
                     if not lasta:
                         raise
                     print("Resten tas vid nästa körning.")
                     break
-                antal, fel = las_veckofil(fil, bolag)
                 behandlade[key] = etag
                 lasta += 1
                 print("%s: %d årsredovisningar, %d fel, %d bolag" % (key, antal, fel, len(bolag)))
