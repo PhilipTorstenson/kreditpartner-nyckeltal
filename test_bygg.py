@@ -127,7 +127,7 @@ def main():
              "arsredovisningar/2026/11_1.zip": open(v2, "rb").read()}
     hamtade = []
     trasiga = {}  # nyckel -> hur många gånger servern svarar med en felsida i stället för zip-filen
-    lage = {"tom_lista": False}
+    lage = {"tom_lista": False, "avbruten_lista": 0}  # avbruten_lista: antal gånger fillistan kapas mitt i
 
     class Latsas(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -145,6 +145,13 @@ def main():
                     "".join("<Contents><Key>%s</Key><ETag>&#34;e-%s&#34;</ETag><Size>1</Size></Contents>"
                             % (k, k[-8:]) for k in nycklar))
                 data = xml.encode()
+                if lage["avbruten_lista"] > 0:
+                    lage["avbruten_lista"] -= 1
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data[: len(data) // 2])  # anslutningen bryts mitt i svaret
+                    return
             else:
                 key = self.path[len("/bulk/"):]
                 hamtade.append(key)
@@ -225,6 +232,12 @@ def main():
     assert not os.path.exists(os.path.join(ut7, "nyckeltal.zip"))
     lage["tom_lista"] = False
     ok("en tom fillista ger fel i stället för en tom nyckeltal.zip")
+
+    lage["avbruten_lista"] = 5  # på GitHub avbröts fillistan fyra gånger i rad, nu räcker försöken till fler
+    ut8 = os.path.join(tmp, "ut8")
+    assert "Klar: 2 bolag" in kor("--ut", ut8, "--fran-ar", "2025")
+    assert lage["avbruten_lista"] == 0
+    ok("en fillista som avbryts mitt i nedladdningen fem gånger i rad hämtas ändå om")
 
     server.shutdown()
     shutil.rmtree(tmp)

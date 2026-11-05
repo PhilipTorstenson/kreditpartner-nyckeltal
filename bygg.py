@@ -269,10 +269,11 @@ def las_veckofil(sokvag, bolag):
     return antal, fel
 
 
-def hamta(url, mal=None, forsok=4, ar_zip=False):
+def hamta(url, mal=None, forsok=8, ar_zip=False):
     """Hämtar url (som text/bytes, eller till filen mal). Med ar_zip=True räknas ett svar som inte
     är en hel zip-fil (till exempel Bolagsverkets felsida "no available server" eller en avbruten
-    nedladdning) som misslyckat, och försöket görs om."""
+    nedladdning) som misslyckat, och försöket görs om. Väntetiden mellan försöken växer men blir
+    aldrig längre än 90 sekunder. Varje misslyckat försök skrivs till loggen."""
     for i in range(1, forsok + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "kreditpartner-nyckeltal"})
@@ -291,7 +292,10 @@ def hamta(url, mal=None, forsok=4, ar_zip=False):
         except Exception as e:
             if i >= forsok:
                 raise RuntimeError("%s: %s" % (url, e))
-            time.sleep(VANTA * i)
+            vanta = min(VANTA * i, 90)
+            print("  försök %d av %d misslyckades (%s: %s), väntar %d s" % (
+                i, forsok, type(e).__name__, str(e)[:120], vanta), file=sys.stderr, flush=True)
+            time.sleep(vanta)
 
 
 def lista_veckofiler():
