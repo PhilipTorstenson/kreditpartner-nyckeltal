@@ -34,6 +34,7 @@ BAS = os.environ.get("BOLAGSVERKET_BAS",
                      "https://vardefulla-datamangder.bolagsverket.se/arsredovisningar-bulkfiler")
 PREFIX = "arsredovisningar/"
 VANTA = float(os.environ.get("BYGG_VANTA", "30"))  # sekunder mellan försöken (proven sätter 0)
+MAX_I_RAD = 3  # så många veckofiler i rad får misslyckas innan bygget tar en paus
 
 # (kolumn, element i den svenska taxonomin, typ). "period" gäller räkenskapsåret, "balans" dess
 # sista dag och "forra" räkenskapsåret innan.
@@ -269,32 +270,79 @@ def las_veckofil(sokvag, bolag):
     return antal, fel
 
 
+def hamta_till_fil(url, mal, minne):
+    """Ett försök att hämta url till filen mal. Finns redan en påbörjad fil fortsätter nedladdningen
+    där den tog slut (Range-anrop), eftersom Bolagsverkets server ibland kapar stora filer i förtid.
+    Filens ETag sparas i minne["etag"] och skickas som If-Range vid fortsättningen: har filen ändrats
+    hos servern emellan skickar den hela filen på nytt. Kastar ett fel om filen inte blev hel."""
+    redan = os.path.getsize(mal) if os.path.exists(mal) else 0
+    headers = {"User-Agent": "kreditpartner-nyckeltal"}
+    if redan:
+        headers["Range"] = "bytes=%d-" % redan
+        if minne.get("etag"):
+            headers["If-Range"] = minne["etag"]
+    try:
+        svar = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=600)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and redan:  # servern godtar inte fortsättningen: börja om från början
+            os.remove(mal)
+        raise
+    with svar:
+        minne["etag"] = svar.headers.get("ETag") or minne.get("etag")
+        if svar.status == 206:
+            m = re.match(r"bytes (\d+)-\d+/(\d+|\*)", svar.headers.get("Content-Range", ""))
+            if not m or int(m.group(1)) != redan:
+                os.remove(mal)
+                raise ValueError("servern skickade fel del av filen")
+            totalt = int(m.group(2)) if m.group(2) != "*" else None
+            lage = "ab"
+        else:  # 200: servern skickar hela filen, så det som redan hämtats kastas
+            langd = svar.headers.get("Content-Length", "")
+            totalt = int(langd) if langd.isdigit() else None
+            lage = "wb"
+        with open(mal, lage) as f:
+            while True:
+                bit = svar.read(1 << 20)
+                if not bit:
+                    break
+                f.write(bit)
+    storlek = os.path.getsize(mal)
+    if totalt is not None and storlek != totalt:
+        raise ValueError("nedladdningen avbröts efter %d av %d byte" % (storlek, totalt))
+
+
 def hamta(url, mal=None, forsok=8, ar_zip=False):
     """Hämtar url (som text/bytes, eller till filen mal). Med ar_zip=True räknas ett svar som inte
-    är en hel zip-fil (till exempel Bolagsverkets felsida "no available server" eller en avbruten
-    nedladdning) som misslyckat, och försöket görs om. Väntetiden mellan försöken växer men blir
-    aldrig längre än 90 sekunder. Varje misslyckat försök skrivs till loggen."""
-    for i in range(1, forsok + 1):
+    är en hel zip-fil (till exempel Bolagsverkets felsida "no available server") som misslyckat, och
+    försöket görs om. En fil som kapas mitt i återupptas där den slutade och räknas inte som ett
+    misslyckat försök så länge den växer. Ger servern inget nytt på `forsok` försök i rad ger hamta
+    upp. Väntetiden mellan försöken växer men blir aldrig längre än 90 sekunder. Varje misslyckat
+    försök skrivs till loggen."""
+    if mal and os.path.exists(mal):
+        os.remove(mal)  # en gammal fil får aldrig tas för en påbörjad nedladdning av den här
+    utan_framsteg, varv, minne = 0, 0, {}
+    while True:
+        varv += 1
+        fore = os.path.getsize(mal) if mal and os.path.exists(mal) else 0
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "kreditpartner-nyckeltal"})
-            with urllib.request.urlopen(req, timeout=600) as svar:
-                if mal is None:
+            if mal is None:
+                req = urllib.request.Request(url, headers={"User-Agent": "kreditpartner-nyckeltal"})
+                with urllib.request.urlopen(req, timeout=600) as svar:
                     return svar.read()
-                with open(mal, "wb") as f:
-                    while True:
-                        bit = svar.read(1 << 20)
-                        if not bit:
-                            break
-                        f.write(bit)
+            hamta_till_fil(url, mal, minne)
             if ar_zip and not zipfile.is_zipfile(mal):
-                raise ValueError("svaret är ingen zip-fil (%d byte)" % os.path.getsize(mal))
+                storlek = os.path.getsize(mal)
+                os.remove(mal)  # en felsida eller trasig fil ska inte byggas vidare på
+                raise ValueError("svaret är ingen zip-fil (%d byte)" % storlek)
             return mal
         except Exception as e:
-            if i >= forsok:
+            efter = os.path.getsize(mal) if mal and os.path.exists(mal) else 0
+            utan_framsteg = 0 if efter > fore else utan_framsteg + 1
+            if utan_framsteg >= forsok or varv >= forsok * 6:
                 raise RuntimeError("%s: %s" % (url, e))
-            vanta = min(VANTA * i, 90)
-            print("  försök %d av %d misslyckades (%s: %s), väntar %d s" % (
-                i, forsok, type(e).__name__, str(e)[:120], vanta), file=sys.stderr, flush=True)
+            vanta = min(VANTA * max(utan_framsteg, 1), 90)
+            print("  försök %d (%d i rad utan framsteg, gräns %d) misslyckades (%s: %s), väntar %d s" % (
+                varv, utan_framsteg, forsok, type(e).__name__, str(e)[:120], vanta), file=sys.stderr, flush=True)
             time.sleep(vanta)
 
 
@@ -340,8 +388,13 @@ def las_forra(mapp, bolag, behandlade):
         print("Behandlade veckofiler: %d" % len(behandlade))
 
 
-def skriv_ut(mapp, bolag, behandlade, klar, kvar):
+def skriv_ut(mapp, bolag, behandlade, klar, kvar, hoppade=()):
+    """status.txt säger vad arbetsflödet ska göra härnäst: "klar" (inget mer att läsa), "ofullstandig"
+    (det finns filer som inte prövats än, så arbetsflödet startar om sig självt) eller "hoppade" (alla
+    filer är prövade men några gick inte att få hela: det hjälper inte att starta om direkt, de prövas
+    igen nästa schemalagda körning)."""
     os.makedirs(mapp, exist_ok=True)
+    status = "klar" if klar else ("hoppade" if kvar == len(hoppade) else "ofullstandig")
     with zipfile.ZipFile(os.path.join(mapp, "nyckeltal.zip"), "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         with z.open("nyckeltal.txt", "w") as f:
             f.write(("\t".join(RUBRIK) + "\n").encode("utf-8"))
@@ -351,13 +404,16 @@ def skriv_ut(mapp, bolag, behandlade, klar, kvar):
         for k in sorted(behandlade):
             f.write("%s\t%s\n" % (k, behandlade[k]))
     with open(os.path.join(mapp, "status.txt"), "w") as f:
-        f.write("klar\n" if klar else "ofullstandig\n")
+        f.write(status + "\n")
     senaste = max(behandlade) if behandlade else "ingen"
     with open(os.path.join(mapp, "notering.md"), "w", encoding="utf-8") as f:
         f.write("Byggd %s. %d bolag.\n\nSenast inlästa veckofil: %s.\n" % (
             dt.date.today().isoformat(), len(bolag), senaste.replace(PREFIX, "")))
         if not klar:
             f.write("\nOfullständig: %d veckofiler återstår och läses vid nästa körning.\n" % kvar)
+        if hoppade:
+            f.write("\nGick inte att hämta hela (prövas igen nästa körning): %s.\n" % ", ".join(
+                h.replace(PREFIX, "") for h in hoppade))
         f.write("\nKälla: Bolagsverket, digitalt inlämnade årsredovisningar (värdefulla datamängder).\n")
 
 
@@ -376,7 +432,7 @@ def main():
     if a.forra:
         las_forra(a.forra, bolag, behandlade)
 
-    klar, kvar = True, 0
+    klar, kvar, hoppade = True, 0, []
     if a.lokal:
         for fil in a.lokal:
             antal, fel = las_veckofil(fil, bolag)
@@ -391,7 +447,7 @@ def main():
             if m and int(m.group(1)) >= a.fran_ar and behandlade.get(key) != etag:
                 att_lasa.append((key, etag))
         print("Veckofiler hos Bolagsverket: %d, att läsa: %d" % (len(alla), len(att_lasa)))
-        lasta = 0
+        lasta, i_rad = 0, 0
         with tempfile.TemporaryDirectory() as tmp:
             for key, etag in att_lasa[: a.max]:
                 if time.time() >= slut:
@@ -402,18 +458,25 @@ def main():
                     hamta(BAS + "/" + key, fil, ar_zip=True)
                     antal, fel = las_veckofil(fil, bolag)
                 except (RuntimeError, zipfile.BadZipFile) as e:
+                    # En fil som inte går att få hel hoppas över och prövas igen nästa körning.
                     print("%s: %s" % (key, e))
-                    if not lasta:
-                        raise
-                    print("Resten tas vid nästa körning.")
-                    break
+                    hoppade.append(key)
+                    i_rad += 1
+                    if i_rad >= MAX_I_RAD:
+                        if not lasta:
+                            raise  # inget alls gick att läsa: Bolagsverket ligger nere, publicera inget
+                        print("%d filer i rad gick inte att hämta, Bolagsverket verkar ha problem. "
+                              "Resten tas vid nästa körning." % i_rad)
+                        break
+                    continue
+                i_rad = 0
                 behandlade[key] = etag
                 lasta += 1
                 print("%s: %d årsredovisningar, %d fel, %d bolag" % (key, antal, fel, len(bolag)))
         kvar = len(att_lasa) - lasta
         klar = kvar == 0
 
-    skriv_ut(a.ut, bolag, behandlade, klar, kvar)
+    skriv_ut(a.ut, bolag, behandlade, klar, kvar, hoppade)
     print("%s: %d bolag" % ("Klar" if klar else "Ofullständig", len(bolag)))
 
 

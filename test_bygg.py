@@ -3,6 +3,7 @@
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -124,10 +125,18 @@ def main():
     # Hela bygget mot en låtsas-Bolagsverket med två sidor i listan.
     filer = {"arsredovisningar/2024/52_1.zip": open(v1, "rb").read(),
              "arsredovisningar/2026/10_1.zip": open(v1, "rb").read(),
-             "arsredovisningar/2026/11_1.zip": open(v2, "rb").read()}
+             "arsredovisningar/2026/11_1.zip": open(v2, "rb").read(),
+             # tre filer till, som bara listas när lage["fler_filer"] är satt
+             "arsredovisningar/2026/12_1.zip": open(v1, "rb").read(),
+             "arsredovisningar/2026/13_1.zip": open(v1, "rb").read(),
+             "arsredovisningar/2026/14_1.zip": open(v1, "rb").read()}
     hamtade = []
+    anrop = []  # (nyckel, Range-huvud, If-Range-huvud) för varje nedladdning
     trasiga = {}  # nyckel -> hur många gånger servern svarar med en felsida i stället för zip-filen
-    lage = {"tom_lista": False, "avbruten_lista": 0}  # avbruten_lista: antal gånger fillistan kapas mitt i
+    kapas = {}  # nyckel -> så många byte skickar servern per svar innan den bryter anslutningen
+    kapningar = {}  # nyckel -> hur många svar servern kapar (resten skickas hela)
+    # avbruten_lista: antal gånger fillistan kapas mitt i. ignorerar_range: servern skickar alltid hela filen.
+    lage = {"tom_lista": False, "avbruten_lista": 0, "ignorerar_range": False, "fler_filer": False}
 
     class Latsas(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -138,6 +147,9 @@ def main():
                 sida2 = "marker=arsredovisningar%2F2026%2F10_1.zip" in self.path
                 nycklar = ["arsredovisningar/2026/11_1.zip"] if sida2 else \
                     ["arsredovisningar/2024/52_1.zip", "arsredovisningar/2026/10_1.zip"]
+                if sida2 and lage["fler_filer"]:
+                    nycklar += ["arsredovisningar/2026/12_1.zip", "arsredovisningar/2026/13_1.zip",
+                                "arsredovisningar/2026/14_1.zip"]
                 if lage["tom_lista"]:
                     nycklar = []
                 xml = "<ListBucketResult><IsTruncated>%s</IsTruncated>%s</ListBucketResult>" % (
@@ -155,11 +167,31 @@ def main():
             else:
                 key = self.path[len("/bulk/"):]
                 hamtade.append(key)
+                onskat = self.headers.get("Range")
+                anrop.append((key, onskat, self.headers.get("If-Range")))
                 if trasiga.get(key, 0) > 0:
                     trasiga[key] -= 1
                     data = b"no available server"  # Bolagsverkets felsida, här med statuskod 200
+                    onskat = None
                 else:
                     data = filer[key]
+                start = 0
+                if onskat and not lage["ignorerar_range"]:
+                    start = int(re.match(r"bytes=(\d+)-", onskat).group(1))
+                    self.send_response(206)
+                    self.send_header("Content-Range", "bytes %d-%d/%d" % (start, len(data) - 1, len(data)))
+                else:
+                    self.send_response(200)
+                self.send_header("ETag", '"e-%s"' % key[-8:])
+                kropp = data[start:]
+                self.send_header("Content-Length", str(len(kropp)))
+                self.end_headers()
+                if kapas.get(key) and kapningar.get(key, 0) > 0 and len(kropp) > kapas[key]:
+                    kapningar[key] -= 1
+                    self.wfile.write(kropp[: kapas[key]])  # anslutningen bryts mitt i svaret
+                    return
+                self.wfile.write(kropp)
+                return
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -214,17 +246,75 @@ def main():
     trasiga[andra] = 10 ** 9
     ut5 = os.path.join(tmp, "ut5")
     utskrift = kor("--ut", ut5, "--fran-ar", "2025")
-    assert "Ofullständig: 2 bolag" in utskrift and open(os.path.join(ut5, "status.txt")).read() == "ofullstandig\n"
+    assert "Ofullständig: 2 bolag" in utskrift
+    assert open(os.path.join(ut5, "status.txt")).read() == "hoppade\n", "alla filer är prövade: ingen omstart"
     assert andra not in open(os.path.join(ut5, "behandlade.txt")).read(), "filen ska läsas om nästa gång"
-    ok("en fil som aldrig går att hämta stoppar inte bygget: det sparar det som är läst och tar resten nästa gång")
+    assert "11_1.zip" in open(os.path.join(ut5, "notering.md"), encoding="utf-8").read()
+    ok("en fil som aldrig går att hämta stoppar inte bygget: det sparar det som är läst och tar den igen nästa gång")
     trasiga[andra] = 0
 
-    trasiga[forsta] = 10 ** 9
+    # Fler filer i listan: en trasig fil först hoppas över, och går inget alls att hämta stannar bygget.
+    lage["fler_filer"] = True
+    trasig3 = ["arsredovisningar/2026/%d_1.zip" % n for n in (10, 11, 12)]
+    for k in trasig3:
+        trasiga[k] = 10 ** 9
     ut6 = os.path.join(tmp, "ut6")
     assert "ingen zip-fil" in kor_fel("--ut", ut6, "--fran-ar", "2025")
     assert not os.path.exists(os.path.join(ut6, "nyckeltal.zip")), "inget får publiceras när inget har lästs"
+    for k in trasig3:
+        trasiga[k] = 0
+    ok("går de första filerna inte att hämta alls misslyckas bygget tydligt utan att skriva något")
+
+    trasiga[forsta] = 10 ** 9
+    ut6b = os.path.join(tmp, "ut6b")
+    utskrift = kor("--ut", ut6b, "--fran-ar", "2025")
+    assert open(os.path.join(ut6b, "status.txt")).read() == "hoppade\n", utskrift
+    klara = open(os.path.join(ut6b, "behandlade.txt")).read()
+    assert forsta not in klara and andra in klara and "14_1.zip" in klara, klara
     trasiga[forsta] = 0
-    ok("går den allra första filen inte att hämta misslyckas bygget tydligt utan att skriva något")
+    ut6c = os.path.join(tmp, "ut6c")
+    kor("--forra", ut6b, "--ut", ut6c, "--fran-ar", "2025")
+    assert open(os.path.join(ut6c, "status.txt")).read() == "klar\n"
+    assert forsta in open(os.path.join(ut6c, "behandlade.txt")).read()
+    ok("en trasig fil först i listan hoppas över, resten läses, och den prövas igen nästa körning")
+    lage["fler_filer"] = False
+
+    # Bolagsverkets server kapar stora filer mitt i. Nedladdningen ska fortsätta där den tog slut.
+    stor = filer[forsta]
+    kapas[forsta], kapningar[forsta] = len(stor) // 12 + 1, 10 ** 9  # varje svar kapas, med och utan Range
+    innan = len(anrop)
+    ut9 = os.path.join(tmp, "ut9")
+    assert "Klar: 2 bolag" in kor("--ut", ut9, "--fran-ar", "2025")
+    mina = [x for x in anrop[innan:] if x[0] == forsta]
+    assert len(mina) > 8, "fler delar än försök i rad: framsteg ska inte räknas som misslyckade försök"
+    assert mina[0][1] is None and all(x[1].startswith("bytes=") for x in mina[1:]), mina
+    assert all(x[2] == '"e-10_1.zip"' for x in mina[1:]), "fortsättningen ska skicka If-Range med ETag"
+    starter = [int(x[1][6:-1]) for x in mina[1:]]
+    assert starter == sorted(set(starter)) and starter[0] > 0, starter
+    ok("en fil som kapas mitt i många gånger hämtas klart genom att nedladdningen fortsätter där den slutade")
+    del kapas[forsta], kapningar[forsta]
+
+    # Svarar servern med hela filen trots Range (ignorerar den) får inget klistras ihop fel.
+    lage["ignorerar_range"] = True
+    kapas[forsta], kapningar[forsta] = len(stor) // 3, 2
+    ut10 = os.path.join(tmp, "ut10")
+    assert "Klar: 2 bolag" in kor("--ut", ut10, "--fran-ar", "2025")
+    lage["ignorerar_range"] = False
+    del kapas[forsta], kapningar[forsta]
+    ok("ignorerar servern Range börjar nedladdningen om i stället för att klistra ihop en trasig fil")
+
+    # En påbörjad fil från en fil som misslyckats får inte tas för början på nästa fil.
+    lage["ignorerar_range"] = True
+    kapas[forsta], kapningar[forsta] = len(stor) // 2, 10 ** 9
+    innan = len(anrop)
+    ut11 = os.path.join(tmp, "ut11")
+    kor("--ut", ut11, "--fran-ar", "2025")
+    assert open(os.path.join(ut11, "status.txt")).read() == "hoppade\n"
+    mina = [x for x in anrop[innan:] if x[0] == andra]
+    assert mina and mina[0][1] is None, "nästa fil ska hämtas från början, utan Range: %s" % mina
+    lage["ignorerar_range"] = False
+    del kapas[forsta], kapningar[forsta]
+    ok("resterna av en misslyckad fil följer inte med till nästa fil")
 
     lage["tom_lista"] = True
     ut7 = os.path.join(tmp, "ut7")
