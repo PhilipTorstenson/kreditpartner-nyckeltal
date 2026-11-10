@@ -1,7 +1,7 @@
-Byggd 2026-11-09. 408969 bolag.
+Byggd 2026-11-10. 461709 bolag.
 
-Senast inlästa veckofil: 2026/11_1.zip.
+Senast inlästa veckofil: 2026/24_7.zip.
 
-Ofullständig: 285 veckofiler återstår och läses vid nästa körning.
+Ofullständig: 165 veckofiler återstår och läses vid nästa körning.
 
 Källa: Bolagsverket, digitalt inlämnade årsredovisningar (värdefulla datamängder).
