@@ -1,4 +1,4 @@
-Byggd 2026-11-10. 505975 bolag.
+Byggd 2026-11-15. 505975 bolag.
 
 Senast inlästa veckofil: 2026/45_5.zip.
 
