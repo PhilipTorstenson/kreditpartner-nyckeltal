@@ -1,5 +1,5 @@
-Byggd 2026-11-15. 505975 bolag.
+Byggd 2026-11-22. 506795 bolag.
 
-Senast inlästa veckofil: 2026/45_5.zip.
+Senast inlästa veckofil: 2026/46_4.zip.
 
 Källa: Bolagsverket, digitalt inlämnade årsredovisningar (värdefulla datamängder).
